@@ -1,0 +1,35 @@
+name: Scrape riyasewana
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # every 6 hours — adjust freely, this part is free
+  workflow_dispatch: {}      # adds a manual "Run workflow" button for testing
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Playwright's Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run scraper
+        run: npm run scrape
+
+      - name: Commit results back to the repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/riyasewana.json
+          git diff --staged --quiet || git commit -m "Update riyasewana listings [skip ci]"
+          git push
