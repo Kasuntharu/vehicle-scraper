@@ -5,6 +5,11 @@ Automated tracker for used Honda Civic (FD generation, roughly 2007–2012) list
 in Sri Lanka, feeding a Google Sheet so listings can be reviewed without manually
 checking multiple sites.
 
+> **Inconsistent year range — needs a decision.** `checkIkman()` filters to
+> 2007–2012, but the riyasewana search URL is `/2008-2015`. So the two sources
+> are not tracking the same set of cars: a 2007 car shows up only from ikman, and
+> a 2013–2015 car only from riyasewana. Pick one range and apply it to both.
+
 ## Google Sheet
 URL: https://docs.google.com/spreadsheets/d/1iGhWelFboI3SSotkoNPf7LCCzOcOJ-j-gflp-ZTW1mE/edit
 Tab: "Listings"
@@ -34,9 +39,37 @@ column positions, so columns can be reordered/added without breaking it.
   blank by design; not worth extra engineering for the little this site offers.
 
 ### 3. riyasewana.com — BLOCKED by Cloudflare, in progress
-- Site returns HTTP 403 (Cloudflare's "Attention Required" bot-challenge page) to
-  any plain server-side fetch — confirmed via testing. No header trick fixes this;
-  it requires a real browser executing Cloudflare's JS challenge.
+- Site returns HTTP 403 with the "Attention Required! | Cloudflare" page to any
+  plain server-side fetch — confirmed via testing. No header trick fixes this.
+
+**Correction (2026-07-30): this is a WAF block, not a JS challenge.**
+Earlier notes here assumed the 403 was Cloudflare's "I'm Under Attack" interstitial,
+which a real browser clears by executing its JS. Testing with real Chromium via
+Playwright disproved that. The page served is *"Sorry, you have been blocked"* —
+a firewall-rule rejection. It contains no `challenge-platform` script, no
+`__cf_chl` token and no Turnstile widget, so there is nothing for a browser to
+solve. Waiting, reloading, and stealth patches cannot change the outcome; only a
+different source IP can. The two cases are worth keeping straight:
+
+| Page | Meaning | Does a real browser help? |
+|---|---|---|
+| "Just a moment..." | JS challenge (IUAM) | Yes — it self-resolves in a few seconds |
+| "Sorry, you have been blocked" | WAF firewall rule | No — the IP was rejected outright |
+
+`scrape.js` now classifies these (`classifyBlock()`) and fails fast on a hard
+block instead of retrying a host that already refused.
+
+**The developer's own IP is currently WAF-blocked.** Testing on 2026-07-30 from
+the dev machine (Dialog Axiata residential, Colombo — `175.157.15.79`) got 403 on
+*every* path including the bare homepage, via real Chromium, plain `curl`, and
+`curl` with a browser UA alike. Since this is a residential Sri Lankan IP — the
+exact thing paid residential-proxy services sell — the most likely cause is that
+the earlier round of scraping from this machine tripped a rule and got the
+address banned. Practical consequences:
+  - riyasewana.com cannot be tested locally until that block ages out. Use the
+    parser fixture approach instead (see README) to verify extraction logic.
+  - This says nothing definitive about GitHub Actions, which runs from entirely
+    different (Azure datacenter) IPs. That remains the open question below.
 - Real HTML structure IS confirmed (via a working paid proxy, before we moved off
   it) — listing cards use classes `.v-card`, `.v-card-price`, `.v-card-year`,
   `.v-card-meta` (contains pin-icon + location + "·" separator + km-icon +
@@ -53,24 +86,50 @@ identity verification, even when the tier itself doesn't charge.
 
 **Current approach: self-hosted, free, via GitHub Actions + Playwright.**
 - Public repo: https://github.com/Kasuntharu/vehicle-scraper
-- Files: `scrape.js` (Playwright script — launches real Chromium with basic
-  stealth patches to navigator.webdriver/plugins/languages, navigates to the
-  search URL, waits for `.v-card` to appear or retries once if still on the
-  challenge page, extracts listings via DOM selectors, writes `data/riyasewana.json`),
-  `package.json`, `.github/workflows/scrape.yml` (cron every 6 hours +
-  manual `workflow_dispatch` trigger, commits results back to the repo).
-- **Two bugs found and just fixed on GitHub's web UI:**
+- Files: `scrape.js` (Playwright script — launches real Chromium in new-headless
+  mode, patches `navigator.webdriver`, navigates to the search URL, waits for
+  `.v-card`, retries a JS challenge up to `MAX_ATTEMPTS` times but fails fast on
+  a hard WAF block, extracts listings via DOM selectors, writes
+  `data/riyasewana.json`), `package.json`, `.github/workflows/scrape.yml` (cron
+  every 6 hours + manual `workflow_dispatch` trigger, commits results back to
+  the repo).
+- The script deliberately does **not** override the user-agent. An earlier version
+  pinned `Chrome/124`, which contradicted the `Sec-CH-UA` client-hint headers the
+  real browser sends — a mismatch that is itself a strong bot signal. It also no
+  longer fakes `navigator.plugins` unconditionally; new-headless Chromium already
+  reports realistic values, and a cruder fake is easier to detect than the real one.
+- The script never writes an empty listing array over a previous good result — an
+  empty page nearly always means "blocked", not "no cars for sale".
+- **Two bugs were identified earlier:**
   1. `package.json` was created empty (0 bytes) — Playwright was never installed.
-  2. Script file was accidentally named `Scrape.JS` (capitalized) while the
-     workflow calls `node scrape.js` (lowercase) — GitHub Actions runs on Linux,
-     which is case-sensitive, so this silently failed to find the file.
-- **Status as of handoff: both bugs just fixed, a re-run was about to be tested.
-  We do NOT yet know if Playwright successfully gets past Cloudflare's challenge**
-  — that's the next real test. If `.v-card` never appears after the retry, the
-  workflow will fail/throw, and the log output is needed to debug further
-  (could mean Cloudflare escalated to a harder challenge, or GitHub Actions'
-  IP ranges are flagged, in which case residential-proxy-based options would
-  need to be reconsidered).
+     This one really was fixed.
+  2. Script file was named `Scrape.JS` (capitalized) while the workflow calls
+     `node scrape.js` (lowercase). GitHub Actions runs on Linux, which is
+     case-sensitive, so the workflow could never find the file.
+- **Bug 2 was NOT actually fixed** despite the earlier note here saying it was —
+  `git ls-tree origin/main` still showed `Scrape.JS` on 2026-07-30. The rename
+  most likely never took on a case-insensitive filesystem (macOS/Windows treat
+  `Scrape.JS` and `scrape.js` as the same path, so a plain rename is a no-op that
+  git does not record). Fixed properly on 2026-07-30 with a two-step
+  `git mv Scrape.JS scrape.js.tmp && git mv scrape.js.tmp scrape.js`. If this
+  ever needs redoing, use the two-step form — a direct `git mv` will silently
+  do nothing here.
+- **Status as of 2026-07-30: the workflow has still never had a clean run**, since
+  until now it was failing at `node scrape.js` (file not found) before Cloudflare
+  was ever reached. **Whether GitHub Actions' IPs can reach riyasewana.com remains
+  genuinely untested.** The next Actions run is the first real test. Read its
+  outcome as follows:
+  - Listings written → done; wire up the Apps Script side.
+  - `"Sorry, you have been blocked"` → Azure/GitHub IP ranges are WAF-banned.
+    This is not fixable with stealth or retries. The realistic options are a
+    residential proxy (rejected: all want a card), running the scraper from a
+    machine on the user's own connection once that IP unbans, or dropping
+    riyasewana from automation and checking it manually.
+  - `"Just a moment..."` that never clears → a real JS challenge is being served
+    and stealth tuning is worth pursuing.
+  The workflow uploads `debug/` (full-page screenshot + HTML of whatever page it
+  got stuck on) as a build artifact on failure, which is what distinguishes these
+  three cases. Download it from the failed run's summary page.
 - Once `data/riyasewana.json` is confirmed to contain real listings, the last
   step is wiring up `checkRiyasewanaFromGitHub()` (Apps Script function,
   already written, needs `GITHUB_RAW_URL` updated to point at

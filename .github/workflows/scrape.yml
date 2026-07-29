@@ -5,6 +5,12 @@ on:
     - cron: '0 */6 * * *'   # every 6 hours — adjust freely, this part is free
   workflow_dispatch: {}      # adds a manual "Run workflow" button for testing
 
+# Two runs pushing to main at once would race each other; let a scheduled run
+# wait rather than clobber a manual test.
+concurrency:
+  group: scrape-riyasewana
+  cancel-in-progress: false
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -16,9 +22,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: npm
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Install Playwright's Chromium
         run: npx playwright install --with-deps chromium
@@ -26,10 +33,33 @@ jobs:
       - name: Run scraper
         run: npm run scrape
 
+      # The screenshot and HTML of the page we got stuck on are the only way to
+      # tell a Cloudflare challenge apart from a changed page layout.
+      - name: Upload debug snapshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-snapshots
+          path: debug/
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Commit results back to the repo
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/riyasewana.json
-          git diff --staged --quiet || git commit -m "Update riyasewana listings [skip ci]"
-          git push
+          if git diff --staged --quiet; then
+            echo "No listing changes to commit."
+            exit 0
+          fi
+          git commit -m "Update riyasewana listings [skip ci]"
+          for attempt in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt) — rebasing on origin/main and retrying."
+            git pull --rebase origin main
+          done
+          echo "Could not push after 3 attempts."
+          exit 1
